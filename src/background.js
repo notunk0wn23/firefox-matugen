@@ -9,8 +9,8 @@ function applyTheme(themeColors) {
 }
 
 async function loadThemeFromFile() {
-  // Update this path to point to your local JSON file
-  const filePath = "file:///path/to/your/theme.json"; 
+  const file = await browser.storage.sync.get('themeFile');
+  const filePath = `file:///${file}`; 
 
   try {
     const response = await fetch(filePath);
@@ -23,8 +23,7 @@ async function loadThemeFromFile() {
   }
 }
 
-// Load theme initially
+// initial load
 loadThemeFromFile();
 
-// Set an interval to check for updates (every 5 seconds for example)
-setInterval(loadThemeFromFile, 5000);
+// this is terrible // setInterval(loadThemeFromFile, 5000);
