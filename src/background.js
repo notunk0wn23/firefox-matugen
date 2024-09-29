@@ -1,14 +1,37 @@
-async function applyTheme(themeColors) {
+async function applyTheme(tcolors) {
     const themeUpdate = {
         colors: {
-            frame: themeColors.background || "#FFFFFF", // Default to white if not specified
-            toolbar: themeColors.primary || "#6200EE", // Default to Material purple
-            textcolor: themeColors.on_primary || "#FFFFFF", // Default to white text on primary
-            accentcolor: themeColors.secondary || "#03DAC6", // Default to teal for accent
+            // Frame
+            frame: tcolors.background,
+            frame_text: tcolors.on_background,
 
-            popup: themeColors.surface || "#FFFFFF", // Default surface color
-            toolbar_text: themeColors.on_background || "#000000", // Text on background
-            tab_background_text: themeColors.on_surface || "#000000", // Text on surface
+            // Tabs
+            tab_background: tcolors.surface,
+            tab_background_text: tcolors.on_surface,
+            tab_active_background: tcolors.primary_container,
+            tab_active_background_text: tcolors.primary,
+
+            // Toolbar
+            toolbar: tcolors.surface,
+            toolbar_text: tcolors.on_surface,
+            toolbar_field: tcolors.primary_container,
+            toolbar_field_text: tcolors.primary,
+            toolbar_field_active: tcolors.primary,
+            toolbar_field_text_active: tcolors.on_primary,
+
+            // Popups
+            popup: tcolors.surface,
+            popup_text: tcolors.on_surface,
+            
+            // Menu
+            menu_background: tcolors.primary_container,
+            menu_text: tcolors.primary,
+
+            // Buttons
+            button_background: tcolors.primary,
+            button_text: tcolors.on_primary,
+
+            //
         }
     };
 
