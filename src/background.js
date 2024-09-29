@@ -17,9 +17,9 @@ async function applyTheme(themeColors) {
 }
 
 async function loadThemeFromFile() {
-  const file = await browser.storage.sync.get('themeFile');
-  const filePath = `${file.themeFile}`; 
-  console.log(filePath)
+  const file = await browser.storage.sync.get('port');
+  const filePath = `http://localhost:${file.port}/colors.json`; 
+ // console.log(filePath)
 
   try {
     const response = await fetch(filePath);
@@ -31,13 +31,29 @@ async function loadThemeFromFile() {
     console.error("Failed to load theme from file:", error);
   }
 }
+// Function to connect to the SSE server
+async function connectToSSE() {
+  const { port } = await browser.storage.local.get('port');
+  const sseUrl = `http://localhost:${port}/updates`;
+
+  const eventSource = new EventSource(sseUrl);
+
+  eventSource.onmessage = (event) => {
+    if (event.data === 'update') {
+      console.log('Theme update received from server');
+      loadThemeFromFile();
+    }
+  };
+
+  eventSource.onerror = (err) => {
+    console.error('SSE connection error:', err);
+  };
+}
 
 // initial load
+connectToSSE();
 loadThemeFromFile();
 
-// this is terrible // setInterval(loadThemeFromFile, 5000);
-// debugging
-//
 async function getURL() {
     return await browser.storage.sync.get('themeFile');
 }
