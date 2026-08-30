@@ -1,14 +1,59 @@
 <!DOCTYPE html>
-<html>
-<head>
-    <title>Matugen theme Settings</title>
-</head>
-<body>
-    <h1>Settings</h1>
-    <label for="directory">Server Port:</label>
-    <input type="text" id="directory" placeholder="ex: 8080">
-    <button id="save">Save</button>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Matugen Firefox - Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Matugen Firefox</h1>
+      <p class="hint">
+        Point this at the helper server that is serving your matugen colors
+        file.
+      </p>
+
+      <form id="settings" novalidate>
+        <div class="field">
+          <label for="port">Server port</label>
+          <input
+            type="number"
+            id="port"
+            name="port"
+            min="1"
+            max="65535"
+            step="1"
+            placeholder="8000"
+            required
+            aria-describedby="port-hint"
+          />
+          <p class="hint" id="port-hint">
+            The <code>--port</code> you passed to <code>server/main.py</code>.
+          </p>
+        </div>
+
+        <div class="field">
+          <label for="scheme">Color scheme</label>
+          <select id="scheme" name="scheme" aria-describedby="scheme-hint">
+            <option value="auto">Follow system</option>
+            <option value="light">Always light</option>
+            <option value="dark">Always dark</option>
+          </select>
+          <p class="hint" id="scheme-hint">
+            Only applies when your colors file contains both variants.
+          </p>
+        </div>
+
+        <div class="actions">
+          <button type="submit" id="save">Save</button>
+          <button type="button" id="test">Test connection</button>
+        </div>
+      </form>
+
+      <!-- Announced to screen readers instead of using alert(). -->
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </main>
 
     <script src="options.js"></script>
-</body>
+  </body>
 </html>

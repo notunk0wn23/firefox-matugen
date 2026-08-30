@@ -1,0 +1,7 @@
+# web-ext build output
+web-ext-artifacts/
+node_modules/
+
+# python
+__pycache__/
+*.pyc
