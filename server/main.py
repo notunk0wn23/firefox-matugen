@@ -1,147 +1,354 @@
-import os
-import argparse
-import subprocess
-import sys
-import signal
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from functools import partial
+#!/usr/bin/env python3
+"""Serve a matugen-generated colors file to the Matugen Firefox extension.
 
-class CORSRequestHandler(SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        super().end_headers()
+The extension needs two things from this server:
 
-def run_server(directory, port):
-import os
+  GET /colors.json  ->  the current colors, as JSON
+  GET /updates      ->  a Server-Sent Events stream that emits `update`
+                        whenever the colors file changes on disk
+
+Only the colors file is ever served. Nothing else in the directory is exposed.
+
+Usage:
+    ./main.py ~/.config/matugen/colors.json
+    ./main.py ~/.config/matugen/colors.json --port 8080 --daemon
+"""
+
+from __future__ import annotations
+
 import argparse
-import subprocess
-import sys
+import errno
+import json
+import os
+import queue
 import signal
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from functools import partial
-import time
+import sys
 import threading
-import mimetypes
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-class CORSRequestHandler(SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        super().end_headers()
+DEFAULT_PORT = 8000
+POLL_INTERVAL = 0.5
+# Comment frames keep proxies and the browser from treating an idle stream as dead,
+# and are how we notice a subscriber has gone away.
+HEARTBEAT_INTERVAL = 15.0
 
-# Global variable to track the last modification time of the theme.json
-last_modified_time = 0
-observers = []
 
-def notify_observers():
-    """Notify all observers that the theme.json file has changed."""
-    global observers
-    for observer in observers:
+class ColorsFile:
+    """Tracks a single colors file and notifies subscribers when it changes."""
+
+    def __init__(self, path: str) -> None:
+        self.path = os.path.abspath(path)
+        self._subscribers: set[queue.Queue[str]] = set()
+        self._lock = threading.Lock()
+        self._stamp = self._read_stamp()
+
+    # --- change detection -------------------------------------------------
+
+    def _read_stamp(self) -> tuple | None:
+        """A cheap fingerprint of the file, or None when it does not exist.
+
+        matugen writes the file by replacing it, so the inode can change without
+        mtime moving. Size and inode are part of the fingerprint for that reason.
+        """
         try:
-            observer.write(b"data: update\n\n")
-            observer.flush()
-        except Exception as e:
-            print(f"Failed to notify observer: {e}")
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
 
-def watch_theme_file(file_path):
-    """Watch the theme.json file for changes and notify observers."""
-    global last_modified_time
-    while True:
-        current_modified_time = os.path.getmtime(file_path)
-        if current_modified_time != last_modified_time:
-            last_modified_time = current_modified_time
-            notify_observers()
-        time.sleep(1)  # Check every second
+    def watch_forever(self) -> None:
+        while True:
+            time.sleep(POLL_INTERVAL)
+            stamp = self._read_stamp()
+            if stamp is not None and stamp != self._stamp:
+                self._stamp = stamp
+                self.publish("update")
 
-class SSERequestHandler(CORSRequestHandler):
-    """Request handler for SSE connections."""
-    def do_GET(self):
-        if self.path == '/updates':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
+    # --- pub/sub ----------------------------------------------------------
+
+    def subscribe(self) -> queue.Queue[str]:
+        q: queue.Queue[str] = queue.Queue(maxsize=8)
+        with self._lock:
+            self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue[str]) -> None:
+        with self._lock:
+            self._subscribers.discard(q)
+
+    def publish(self, event: str) -> None:
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                # A subscriber that cannot keep up will still get the next event.
+                pass
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
+
+    # --- reading ----------------------------------------------------------
+
+    def read_bytes(self) -> bytes:
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+
+def make_handler(colors: ColorsFile, allow_origin: str):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "matugen-firefox"
+        sys_version = ""
+
+        # -- helpers -------------------------------------------------------
+
+        def _cors(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", allow_origin)
+            self.send_header("Vary", "Origin")
+
+        def _fail(self, status: HTTPStatus, message: str) -> None:
+            body = json.dumps({"error": message}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args) -> None:
+            sys.stderr.write(
+                "%s - %s\n" % (self.address_string(), fmt % args)
+            )
+
+        # -- routes --------------------------------------------------------
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._cors()
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
-            # Add this connection to the observers list
-            observers.append(self)
+        def do_GET(self) -> None:
+            route = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if route == "/updates":
+                self.serve_events()
+            elif route in ("/colors.json", "/"):
+                self.serve_colors()
+            elif route == "/health":
+                self.serve_health()
+            else:
+                self._fail(HTTPStatus.NOT_FOUND, "not found")
 
+        def serve_colors(self) -> None:
             try:
-                # Keep the connection open
+                payload = colors.read_bytes()
+            except FileNotFoundError:
+                self._fail(
+                    HTTPStatus.NOT_FOUND,
+                    f"{colors.path} does not exist yet - run matugen once",
+                )
+                return
+            except OSError as exc:
+                self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                return
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def serve_health(self) -> None:
+            body = json.dumps(
+                {
+                    "colors_file": colors.path,
+                    "exists": os.path.exists(colors.path),
+                    "subscribers": colors.subscriber_count,
+                }
+            ).encode()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def serve_events(self) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self._cors()
+            self.end_headers()
+
+            q = colors.subscribe()
+            try:
+                self._write_frame(": connected\n\n")
                 while True:
-                    time.sleep(1)
-            except Exception as e:
-                print(f"Connection closed: {e}")
+                    try:
+                        event = q.get(timeout=HEARTBEAT_INTERVAL)
+                    except queue.Empty:
+                        # Heartbeat doubles as a liveness probe: if the client is
+                        # gone this raises and we clean up.
+                        self._write_frame(": ping\n\n")
+                        continue
+                    self._write_frame(f"data: {event}\n\n")
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                pass
+            except OSError as exc:
+                if exc.errno not in (errno.EPIPE, errno.ECONNRESET):
+                    raise
             finally:
-                observers.remove(self)
+                colors.unsubscribe(q)
+                self.close_connection = True
 
-        else:
-            super().do_GET()
+        def _write_frame(self, text: str) -> None:
+            self.wfile.write(text.encode())
+            self.wfile.flush()
 
-def run_server(directory, port):
-    os.chdir(directory)
-    handler = partial(SSERequestHandler, directory=directory)
-    httpd = HTTPServer(('localhost', port), handler)
+    return Handler
 
-    # Start a background thread to watch the theme.json file
-    theme_file_path = os.path.join(directory, 'theme.json')
-    if os.path.exists(theme_file_path):
-        threading.Thread(target=watch_theme_file, args=(theme_file_path,), daemon=True).start()
 
-    print(f"Serving {directory} on port {port}...")
-    httpd.serve_forever()
-
-def start_server_as_daemon(directory, port):
+def daemonize(log_path: str | None) -> None:
+    """Detach from the terminal, keeping stderr on a log file when asked."""
     if os.fork() > 0:
-        sys.exit()
-
+        os._exit(0)
     os.setsid()
     if os.fork() > 0:
-        sys.exit()
+        os._exit(0)
 
     sys.stdout.flush()
     sys.stderr.flush()
-    with open(os.devnull, 'w') as fnull:
-        os.dup2(fnull.fileno(), sys.stdin.fileno())
-        os.dup2(fnull.fileno(), sys.stdout.fileno())
-        os.dup2(fnull.fileno(), sys.stderr.fileno())
 
-    run_server(directory, port)
+    target = open(log_path, "a") if log_path else open(os.devnull, "w")
+    with open(os.devnull, "r") as devnull_in:
+        os.dup2(devnull_in.fileno(), sys.stdin.fileno())
+    os.dup2(target.fileno(), sys.stdout.fileno())
+    os.dup2(target.fileno(), sys.stderr.fileno())
 
-def check_and_kill_existing_server(port):
-    # Get the process ID of the running server
-    try:
-        result = subprocess.run(
-            ["lsof", "-t", f"-i:{port}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
+
+def write_pidfile(path: str) -> None:
+    with open(path, "w") as fh:
+        fh.write(f"{os.getpid()}\n")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Serve a matugen colors file to the Matugen Firefox extension."
+    )
+    parser.add_argument(
+        "path",
+        help="Path to the matugen-generated colors JSON file.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Port to listen on (default: {DEFAULT_PORT}).",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Address to bind (default: 127.0.0.1 - loopback only).",
+    )
+    parser.add_argument(
+        "--allow-origin",
+        default="*",
+        help=(
+            "Value for Access-Control-Allow-Origin. Set this to your extension's "
+            "moz-extension://<uuid> origin to stop other pages reading your colors."
+        ),
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Detach and run in the background.",
+    )
+    parser.add_argument(
+        "--log-file",
+        help="With --daemon, append output here instead of discarding it.",
+    )
+    parser.add_argument("--pidfile", help="Write the server PID to this file.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if os.path.isdir(args.path):
+        print(
+            f"Error: {args.path} is a directory. Pass the colors JSON file itself.",
+            file=sys.stderr,
         )
-        pids = result.stdout.decode().strip().split()
-        for pid in pids:
-            print(f"Killing existing server with PID: {pid}")
-            os.kill(int(pid), signal.SIGTERM)
-    except subprocess.CalledProcessError:
-        # No process found on that port
-        pass
+        return 2
 
-def main():
-    parser = argparse.ArgumentParser(description="Serve a file or directory over HTTP as a daemon with CORS.")
-    parser.add_argument('path', help="Path to the file or directory to serve.")
-    parser.add_argument('--port', type=int, default=8000, help="Port to run the HTTP server on (default: 8000)")
-    args = parser.parse_args()
+    colors = ColorsFile(args.path)
+    if not os.path.exists(colors.path):
+        # Not fatal: matugen may not have run yet. The watcher picks it up later.
+        print(
+            f"Warning: {colors.path} does not exist yet; "
+            "serving 404 until matugen creates it.",
+            file=sys.stderr,
+        )
 
-    if not os.path.exists(args.path):
-        print(f"Error: {args.path} does not exist.")
-        return
+    handler = make_handler(colors, args.allow_origin)
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), handler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(
+                f"Error: port {args.port} is already in use. "
+                "Stop the other server or pick a different --port.",
+                file=sys.stderr,
+            )
+            return 1
+        raise
+    httpd.daemon_threads = True
 
-    directory = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
+    if args.daemon:
+        httpd.server_close()
+        daemonize(args.log_file)
+        httpd = ThreadingHTTPServer((args.host, args.port), handler)
+        httpd.daemon_threads = True
 
-    # Check and kill existing server if running
-    check_and_kill_existing_server(args.port)
+    if args.pidfile:
+        write_pidfile(args.pidfile)
 
-    print(f"Starting HTTP server in the background for {directory} on port {args.port}...")
-    
-    start_server_as_daemon(directory, args.port)
+    def shutdown(signum, _frame):
+        print(f"Received signal {signum}, shutting down.", file=sys.stderr)
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    threading.Thread(target=colors.watch_forever, daemon=True).start()
+
+    print(
+        f"Serving {colors.path} on http://{args.host}:{args.port} "
+        "(/colors.json, /updates, /health)",
+        file=sys.stderr,
+    )
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        if args.pidfile:
+            try:
+                os.unlink(args.pidfile)
+            except OSError:
+                pass
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
